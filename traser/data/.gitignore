@@ -1,0 +1,3 @@
+# Generated training data (see ../../docs/DATA.md) — not part of the release.
+*.json
+masks/

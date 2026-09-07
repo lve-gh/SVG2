@@ -1,0 +1,85 @@
+io:
+  output_dir: outputs
+  overwrite: false
+runtime:
+  device: cuda
+  log_level: INFO
+mask_gen:
+  model_id: facebook/sam2.1-hiera-large
+  frame_sample_rate: 20
+  grid_points_per_side:
+  - 32
+  - 16
+  - 4
+  points_per_batch: 64
+  pred_iou_thresh: 0.75
+  stability_score_thresh: 0.85
+  stability_score_offset: 1.0
+  box_nms_thresh: 0.7
+  crop_nms_thresh: 0.7
+  crop_overlap_ratio: 0.5
+  min_mask_region_area: 200
+  use_m2m: true
+  max_overlap_ratio: 0.9
+tracking:
+  model_id: facebook/sam2.1-hiera-large
+  offload_to_cpu: true
+  max_objects: 65
+  rediscovery_enabled: true
+  rediscovery_overlap_thresh: 0.1
+  rediscovery_min_untracked_frac: 0.05
+  match_iou_thresh: 0.9
+  adaptive_sample_rate: true
+cleanup:
+  enabled: true
+  contain_ratio_thresh: 0.9
+  coverage_share_thresh: 0.7
+  min_overlap_frames: 5
+  morph_kernel: 3
+  morph_iterations: 1
+  morph_min_area: 32
+caption:
+  model_id: nvidia/DAM-3B-Video
+  prompt_mode: focal_prompt
+  conv_mode: v1
+  max_objects: 40
+  frames_per_object: 8
+  frame_sampling: uniform
+  temperature: 0.2
+  top_p: 0.5
+  num_beams: 1
+  max_new_tokens: 512
+  prompt: 'Video: {image_tokens}
+
+    Given the video in the form of a sequence of frames above, describe the object
+    in the masked region in the video in detail.'
+structure:
+  enabled: true
+  model_id: gpt-5-mini
+  api_key_env: OPENAI_API_KEY
+  base_url: null
+  temperature: null
+  max_retries: 3
+relationship:
+  enabled: true
+  model_id: gpt-5
+  api_key_env: OPENAI_API_KEY
+  base_url: null
+  extract_temporal: true
+  extract_spatial: true
+  frame_sample_fps: 1.0
+  max_frames: 24
+  image_detail: high
+  reasoning_effort: medium
+  max_completion_tokens: 8192
+  keep_uncertain: false
+  max_retries: 3
+start_stage: 1
+end_stage: 6
+save_stages:
+- 1
+- 2
+- 3
+- 4
+- 5
+- 6

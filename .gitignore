@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# pipeline
+pipeline/.cache/
+pipeline/outputs/
+outputs/
+
+# inference example downloaded from the Hub (docs/INFERENCE.md)
+traser/examples/example/
+
+# training data and checkpoints (see docs/DATA.md)
+traser/data/*.json
+traser/data/masks/
+traser/checkpoints/
+SVG2/
+wandb/
+output/
