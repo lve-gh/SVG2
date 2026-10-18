@@ -1,0 +1,416 @@
+% TRASER-F: прогнозирование графов сцены на PSG4D-HOI.
+% Сборка: tectonic traser_f_report.tex
+\documentclass[11pt,a4paper]{article}
+
+\usepackage{fontspec}
+\setmainfont{cmunrm.otf}[BoldFont=cmunbx.otf,ItalicFont=cmunti.otf,BoldItalicFont=cmunbi.otf]
+\setsansfont{cmunss.otf}[BoldFont=cmunsx.otf]
+\setmonofont{cmuntt.otf}[BoldFont=cmuntb.otf]
+\usepackage[english,russian]{babel}
+\usepackage[margin=2.2cm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs,tabularx,array,multirow}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{listings}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,fit,calc}
+\usepackage{xurl}
+\usepackage[hidelinks]{hyperref}
+\emergencystretch=3em
+
+\selectlanguage{russian}
+\setlist{itemsep=2pt,topsep=4pt}
+\definecolor{codebg}{RGB}{246,246,246}
+\definecolor{accent}{RGB}{30,90,160}
+\lstset{basicstyle=\ttfamily\small,backgroundcolor=\color{codebg},frame=single,
+  rulecolor=\color{black!15},breaklines=true,columns=fullflexible,keepspaces=true,
+  extendedchars=true,xleftmargin=4pt,xrightmargin=4pt}
+\newcommand{\code}[1]{\texttt{#1}}
+\newcolumntype{L}{>{\raggedright\arraybackslash}X}
+
+\title{\textbf{TRASER-F: прогнозирование графов сцены}\\[2pt]
+  \large Тройки и локализация объектов на PSG4D-HOI}
+\author{Репозиторий \href{https://github.com/lve-gh/SVG2/tree/forecasting}{\code{lve-gh/SVG2}}, ветка \code{forecasting}}
+\date{18 октября 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+TRASER (ECCV 2026) строит граф сцены по уже увиденному видео. Мы добавили к нему прогноз:
+по первым $H$ секундам клипа и маскам объектов модель предсказывает отношения
+(субъект, предикат, объект) на следующие $F$ секунд и положение каждого объекта, $H,F\in[1,5]$~с.
+Документ описывает выбранную архитектуру TRASER-F и почему выбрана именно она, обзор
+современных подходов, протокол оценки, написанный код, что уже проверено и что остаётся
+сделать на сервере. Обучение на полных весах ещё не запускалось.
+\end{abstract}
+
+\tableofcontents
+
+%======================================================================
+\section{Задача и данные}
+
+\paragraph{Постановка.}
+\begin{center}
+\begin{tabularx}{\linewidth}{@{}lL@{}}
+\toprule
+Вход & кадры интервала $[T-H,\,T)$ с частотой 2~кадра/с, маски объектов на этих кадрах, классы объектов \\
+Выход & \code{\{"relationships": [[s, pred, o, [[t0, t1]]], ...]\}} для секунд $H,\dots,H+F-1$ клипа;
+        для каждого объекта и каждой будущей секунды~--- бокс $(c_x,c_y,w,h)$ и видимость \\
+Объекты & видимые в наблюдаемой части; новые объекты в будущем не появляются (как в SGA) \\
+\bottomrule
+\end{tabularx}
+\end{center}
+Это соответствует режимам GAGS/PGAGS из scene graph anticipation (объекты даны, прогнозируются
+отношения) плюс локализация из scene graph \emph{forecasting} (FDSG).
+
+\paragraph{PSG4D-HOI.} Часть PSG4D, построенная на HOI4D (без GTA-части):
+\begin{itemize}
+  \item 2973 эгоцентричных видео по 20~с, 15~кадров/с (300 кадров), $1920\times1080$;
+  \item 46 классов объектов и около 15 предикатов: \emph{reachout, grasp, pickup, putdown,
+        carry, carrywithbothhands, open, close, push, pull, press, cut, dump, binding};
+  \item субъект почти всегда \code{hand}; все исполнители (H1--H4)~--- люди, роборук нет.
+\end{itemize}
+В HOI4D действия размечены отрезками времени (\code{action/color.json}), маски объектов~---
+цветные PNG (\code{2Dseg/shift\_mask}). Из этого же PSG4D получал свои отношения
+(«hand \textless действие\textgreater{} \textless объект\textgreater»), поэтому
+конвертер умеет собирать разметку и напрямую из HOI4D (раздел~\ref{sec:code}).
+
+\paragraph{Особенность данных.} Действия короткие: grasp $\approx 0{,}45$~с, pickup
+$\approx 0{,}4$~с. В одну секунду часто попадают 2--3 предиката подряд, и их порядок внутри
+секунды теряется. Это учтено в открытых вопросах (раздел~\ref{sec:open}).
+
+%======================================================================
+\section{Обзор современных подходов}
+
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}p{2.6cm}p{1.6cm}Lp{0.9cm}L@{}}
+\toprule
+Метод & Где & Как прогнозирует & Боксы & Что взяли в TRASER-F \\
+\midrule
+STTran+/++, DSG-DETR+/++ & базовые в SceneSayer & авторегрессионный трансформер & нет & авторегрессия накапливает ошибку \\
+SceneSayer ODE/SDE & ECCV'24 & динамика признаков пар объектов в латентном пространстве (NeuralODE/SDE) & да & \textbf{прогноз в латентах}, декодирование теми же головами \\
+ImparTail & CVPR'25 & SceneSayer/STTran + curriculum с маскированием неполной разметки & --- & устойчивость к пропускам в разметке \\
+FDSG & 2025 & NeuralSDE на запросах DETR, бокс = тождество + поправка & \textbf{да} & \textbf{бокс = последний + $\Delta$}; метрики SGF с IoU $\ge 0{,}5$ \\
+HyperGLM & CVPR'25 & гиперграф + мультимодальная LLM & нет & LLM-декодер конкурентен в SGA \\
+OOTSM & 2025 & LLM по текстовым графам: сначала объекты, потом отношения & нет & LLM даёт больше всего в mR (+21,9 mR@50) \\
+FORESCENE & 2025 & латентная диффузия графов & нет & вероятностный прогноз~--- следующий шаг \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+Ни один из методов не работает с токенами траекторий объектов внутри видео-LLM.
+TRASER-F переносит идею SceneSayer/FDSG (латентная динамика, условие на горизонт, поправка
+к последнему состоянию) в собственное представление TRASER и оставляет LLM TRASER
+декодером, как в HyperGLM/OOTSM.
+
+%======================================================================
+\section{Архитектура TRASER-F}
+
+\subsection{Исходный TRASER}
+Qwen2.5-VL-3B и два Perceiver-ресемплера. Токены ViT отбираются по покрытию маской объекта;
+для каждого объекта строится блок: OTR (вся траектория, 32 латента) и TWR (32 латента на
+каждое временное окно). LLM читает блоки объектов и выдаёт граф сцены в JSON.
+Мы берём частоту 2~кадра/с: при временном патче~2 один грид ViT равен одной секунде,
+т.\,е. одному окну TWR.
+
+\subsection{Схема}
+
+\begin{center}
+\begin{tikzpicture}[
+  box/.style={draw, rounded corners=2pt, align=center, font=\small, minimum height=8mm, inner sep=4pt},
+  new/.style={box, fill=accent!12, draw=accent, thick},
+  old/.style={box, fill=black!4},
+  arr/.style={-{Stealth[length=2.2mm]}, thick}]
+  \node[old] (v) {кадры истории\\$[T-H,T)$};
+  \node[old, right=6mm of v] (vit) {ViT\\Qwen2.5-VL};
+  \node[old, right=6mm of vit] (sel) {отбор токенов\\по маскам};
+  \node[old, right=6mm of sel] (res) {OTR + TWR\\на объект};
+  \coordinate (mid) at ($(v.south west)!0.5!(res.south east)$);
+  \node[new, below=11mm of mid, anchor=north, text width=9.5cm] (fc) {\textbf{Прогнозатор латентов} (новый, $\approx$24M)\\
+     токены: (объект, окно истории) + OTR + запрос (объект, будущее окно)\\
+     энкодер по всем объектам $\to$ декодер: 32 латента на запрос\\
+     латенты $=$ последние $+\,\Delta$, \quad бокс $=$ последний $+\,\Delta$, видимость};
+  \node[old, below=10mm of fc, text width=11.5cm, font=\ttfamily\footnotesize] (blk) {%
+     <obj\_traj\_start> Object k (bottle): <vision\_start> [OTR]\\
+     <0 - 1 sec>[TWR] ... <H-1 - H sec>[TWR]\\
+     \textcolor{accent}{<forecast H - H+1 sec>[прогноз] ... <forecast H+F-1 - H+F sec>[прогноз]}\\
+     <vision\_end> <obj\_traj\_end> \quad $\times$ каждый объект};
+  \node[old, below=8mm of blk] (llm) {LLM TRASER $\to$ будущие отношения в JSON};
+  \draw[arr] (v) -- (vit); \draw[arr] (vit) -- (sel); \draw[arr] (sel) -- (res);
+  \draw[arr] (res.south) |- ($(fc.north)+(0,5mm)$) -- (fc.north);
+  \draw[arr] (fc) -- (blk); \draw[arr] (blk) -- (llm);
+  \draw[arr, dashed] (res.east) -- ++(5mm,0) |- node[pos=0.25, right, font=\footnotesize, align=left] {латенты\\истории} (blk.east);
+\end{tikzpicture}
+\end{center}
+
+\subsection{Прогнозатор латентов}
+Класс \code{ObjectLatentForecaster} (\code{forecast/dynamics.py}).
+\begin{itemize}
+  \item \textbf{Токены.} Для каждого объекта: по токену на окно истории
+        (усреднённые латенты TWR после LayerNorm и проекции + бокс окна), токен OTR и по запросу на
+        каждое будущее окно. К каждому токену добавляются эмбеддинги абсолютного времени, типа
+        токена (история / запрос / OTR) и индекса объекта.
+  \item \textbf{Энкодер.} Трансформер (4 слоя, $d=512$, 8 голов, pre-norm) по \emph{всем}
+        токенам клипа: объекты видят друг друга.
+  \item \textbf{Декодер.} 2 слоя: 32 обучаемых запроса, сдвинутых выходом энкодера для
+        данного (объект, окно), смотрят на последние наблюдённые латенты объекта и дают
+        $R=32$ латента будущего окна.
+  \item \textbf{Выходы.}
+        $\hat z_{t} = z_{\text{last}} + W_{\text{out}}\,h_t$,\quad
+        $\hat b_t = \operatorname{clip}(b_{\text{last}} + \Delta b_t)$,\quad логит видимости.
+        $W_{\text{out}}$ и голова $\Delta b$ инициализированы нулями: до обучения модель
+        \emph{в точности} равна базовому copy-last.
+  \item Около 23,7M параметров при $d_{\text{LLM}}=2048$.
+\end{itemize}
+
+\subsection{Почему эта архитектура}
+\begin{enumerate}
+  \item \textbf{Прогноз в латентах TRASER.} Будущие слоты заполняются латентами того же вида,
+        что LLM уже умеет читать, поэтому декодер графа TRASER переиспользуется как есть.
+  \item \textbf{Сразу весь горизонт, без авторегрессии.} Каждое будущее окно предсказывается
+        напрямую по истории (запрос = объект + абсолютное время), ошибка на 5~с не накапливается.
+  \item \textbf{Взаимодействие объектов.} Рука, тянущаяся к бутылке, меняет будущее бутылки.
+  \item \textbf{Старт с copy-last.} Обучение отходит от инерции только там, где это помогает;
+        модель не может стать хуже базового метода из-за плохой инициализации.
+  \item \textbf{Бесплатная плотная разметка.} На обучении будущие кадры известны: латенты,
+        которые ресемплер строит по ним, служат целями дистилляции без дополнительной разметки.
+  \item \textbf{Нет утечки будущего.} ViT Qwen2.5-VL работает внутри одного временного грида
+        (\code{cu\_seqlens}), поэтому кодирование всего клипа даёт те же признаки истории, что
+        кодирование одной истории (проверено тестом). При оценке модели подаются только
+        наблюдаемые кадры.
+\end{enumerate}
+
+\subsection{Функция потерь и обучение}
+\[
+\begin{aligned}
+\mathcal L = {} & \mathcal L_{\text{LM}}(\text{будущий JSON})
+  + \lambda_{\text{lat}}\,\bigl\lVert \mathrm{LN}(\hat z) - \mathrm{LN}(\operatorname{sg}(z^{\text{teacher}}))\bigr\rVert_2^2 \\
+  & + \lambda_{\text{box}}\,\bigl(5\,\mathcal L_{1} + 2\,\mathcal L_{\text{GIoU}} + \mathcal L_{\text{BCE}}^{\text{vis}}\bigr),
+\qquad \lambda_{\text{lat}}=\lambda_{\text{box}}=1.
+\end{aligned}
+\]
+Цели $z^{\text{teacher}}$~--- латенты TWR реальных будущих окон, посчитанные без градиента.
+
+\begin{center}
+\begin{tabularx}{\linewidth}{@{}lp{3.6cm}p{2.6cm}L@{}}
+\toprule
+Этап & Обучается & LR & Зачем \\
+\midrule
+A, 20 эпох & только прогнозатор & $10^{-4}$ & выучить динамику против замороженного TRASER: дёшево, учитель стабилен \\
+B, 10 эпох & LLM \newline merger \newline ресемплеры \newline прогнозатор
+           & $10^{-5}$ \newline $2\cdot10^{-5}$ \newline $5\cdot10^{-5}$ \newline $5\cdot10^{-5}$ & адаптировать декодер к прогнозу \\
+\bottomrule
+\end{tabularx}
+\end{center}
+DeepSpeed ZeRO-3 с offload, bf16, накопление градиента 4, косинусный LR.
+Клипы собираются на лету: случайные $H,F\in[1,5]$; в 70\,\% случаев якорь выбирается так,
+чтобы в будущем окне начиналось отношение; клипы с пустым будущим сохраняются в 10\,\% случаев.
+
+\paragraph{Режимы} (\code{--forecast\_mode}, один флаг): \code{latent}~--- основная модель;
+\code{copy}~--- в будущие слоты копируются последние латенты; \code{oracle}~--- настоящие
+будущие латенты (потолок); \code{prompt}~--- будущих слотов нет, LLM прогнозирует только по истории.
+
+%======================================================================
+\section{Протокол оценки}
+
+\paragraph{Данные.} PSG4D-HOI, разбиение \emph{по экземплярам объектов} (\code{C*/N*} в пути
+HOI4D), 75/10/15: тестовые объекты в обучении не встречаются.
+
+\paragraph{Клипы.} Каждую секунду каждого тестового видео, для $(H,F)\in\{1,3,5\}^2$.
+Основной результат~--- $H=3$, $F=3$. Все методы, включая базовые без обучения, оцениваются
+на одних и тех же клипах (общая функция \code{clip\_targets}).
+
+\paragraph{Метрики} (\code{forecast/metrics.py}), по будущим секундам:
+\begin{center}
+\begin{tabularx}{\linewidth}{@{}lL@{}}
+\toprule
+R, mR & полнота четвёрок (s, pred, o, секунда); mR~--- среднее по предикатам \\
+P, F1 & точность, чтобы не окупалось перечисление всех предикатов \\
+R@$k$ & полнота на $k$-й секунде вперёд (как быстро падает качество) \\
+mIoU@$k$, ADE, FDE & прогноз бокса против реального \\
+R\textsubscript{loc} & как в SGF: тройка верна \emph{и} боксы обоих объектов с IoU $\ge 0{,}5$ \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\paragraph{Базовые методы} (\code{forecast/baselines.py}). Для троек: copy-last и марковская
+цепочка переходов предикатов; для боксов: copy и постоянная скорость. Им даётся истинный
+наблюдаемый граф, т.\,е. больше, чем видит модель, поэтому обойти их~--- содержательный рубеж.
+
+\paragraph{ImparTail / SceneSayer.} Их код привязан к Action Genome (боксы по кадрам,
+признаки Faster R-CNN). Два сравнения:
+\begin{enumerate}
+  \item \emph{На PSG4D-HOI:} обучить SceneSayerSDE (с curriculum ImparTail и без) на нашем
+        разбиении в режиме PGAGS/GAGS, боксы из наших масок, 1 кадр/с; оценка
+        \code{recall\_at\_k} на наших четвёрках.
+  \item \emph{На Action Genome:} прогнать TRASER-F с прямоугольными масками из разметки AG по
+        протоколу SGA ($F\in\{0{,}3;0{,}5;0{,}7;0{,}9\}$, R@10/20/50 With/No constraint) и
+        сравнить с опубликованными SceneSayerSDE, ImparTail, FDSG.
+\end{enumerate}
+
+\paragraph{Гипотезы и абляции.} Всё с одинаковыми данными, расписанием и оценкой; меняется один флаг.
+\begin{center}
+\begin{tabularx}{\linewidth}{@{}lLl@{}}
+\toprule
+ID & Гипотеза & Запуск \\
+\midrule
+B0 & инерция~--- сильный базовый метод & \code{baselines.py}, \code{--mode copy} \\
+H1 & LLM может прогнозировать по одной истории & \code{MODE=prompt} \\
+H2 & латентная динамика лучше инерции (основная модель) & \code{MODE=latent} \\
+H2a & работает именно дистилляция латентов & \code{LAMBDA\_LATENT=0} \\
+H2b & боксы помогают отношениям & \code{LAMBDA\_BOX=0} \\
+UB & потолок при идеальной динамике & \code{evaluate.py --mode oracle} \\
+H3 & длина истории важна & одна модель, $H=1\dots5$ \\
+\bottomrule
+\end{tabularx}
+\end{center}
+Сравнение \code{oracle}/\code{latent}/\code{copy} разделяет ошибку на «динамику» и
+«декодирование»: если \code{oracle} ненамного лучше \code{copy}, узкое место в декодере.
+
+%======================================================================
+\section{Что написано}\label{sec:code}
+
+Весь код~--- новые файлы; исходный код TRASER не изменён.
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}p{6.7cm}L@{}}
+\toprule
+Файл & Содержание \\
+\midrule
+\multicolumn{2}{@{}l}{\code{traser/traser\_train/forecast/}} \\
+\quad\code{data\_forecast.py} & формат разметки, нарезка клипов, боксы из RLE-масок, \code{ForecastDataset}, коллатор \\
+\quad\code{dynamics.py} & прогнозатор латентов, лоссы дистилляции и боксов (L1, GIoU, BCE) \\
+\quad\code{arrangement.py} & сборка входа LLM: блоки объектов с будущими слотами, позиции, \code{rope\_deltas} \\
+\quad\code{step.py} & отбор токенов по маскам для истории и будущего, метки времени \\
+\quad\code{modeling\_forecast.py} & \code{TRASERForecast(TRASER)}, загрузка из чекпойнта TRASER, инициализация под ZeRO-3 \\
+\quad\code{trainer\_forecast.py} & \code{ForecastTrainer}: группы LR, суммарный лосс, логирование составляющих \\
+\quad\code{train\_forecast.py} & точка входа обучения, аргументы \\
+\quad\code{metrics.py} & разбор JSON, R/P/F1/mR/R@$k$, mIoU, ADE/FDE, R\textsubscript{loc} \\
+\quad\code{baselines.py} & copy-last, марковская цепочка, боксы copy/velocity \\
+\quad\code{evaluate.py} & оценка: только кадры истории, генерация, метрики, jsonl \\
+\midrule
+\code{traser/data/prepare\_psg4d\_hoi.py} & конвертер: \code{psg4d} (JSON PSG4D-HOI) и \code{hoi4d} (действия HOI4D) \\
+\code{traser/scripts/train\_forecast.sh} & этапы A/B через DeepSpeed \\
+\code{traser/tests/test\_forecast\_smoke.py} & smoke-тест на крошечной случайной модели (CPU) \\
+\code{docs/FORECAST.md} & описание на английском \\
+\code{docs/report/} & этот отчёт (\code{.tex} и \code{.pdf}) \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\paragraph{Формат разметки.}
+\begin{lstlisting}
+{"video": ".../image.mp4", "mask_json": ".../<seq>_rle.json", "fps": 15,
+ "num_frames": 300, "objects": [{"id": 0, "name": "toy car"}, {"id": 1, "name": "right hand"}],
+ "relationships": [[1, "grasp", 0, [[45, 52], [180, 190]]], ...]}
+\end{lstlisting}
+\code{mask\_json}~--- список по кадрам, в каждом COCO-RLE для каждого объекта; интервалы
+отношений~--- в исходных кадрах.
+
+%======================================================================
+\section{Что проверено}
+
+\paragraph{Smoke-тест} (\code{python traser/tests/test\_forecast\_smoke.py}; случайная
+Qwen2.5-VL с $d=64$, синтетический клип 8~с: рука движется к бутылке)~--- проходит целиком:
+\begin{enumerate}[label=\arabic*.]
+  \item датасет собирает клипы с нужным числом окон истории и будущего;
+  \item утечки будущего через ViT нет;
+  \item при инициализации прогноз в точности равен copy-last, в том числе
+        (3b) при загрузке чекпойнта TRASER без прогнозатора;
+  \item градиенты доходят до прогнозатора; два шага \code{ForecastTrainer.train()};
+  \item оценка: генерация, разбор, метрики, базовые методы.
+\end{enumerate}
+Найден и исправлен баг: стандартная инициализация HF не трогает \code{in\_proj\_weight} у
+\code{nn.MultiheadAttention}, и при загрузке из чекпойнта TRASER эти веса остались бы
+неинициализированными.
+
+\paragraph{Реальное видео HOI4D} (категория C1, игрушечная машинка; объекты toy car и right
+hand, 12 отрезков отношений, разметка через конвертер \code{hoi4d}): сборка клипа 3,7~с,
+грид $6\times40\times72$, длина собранной последовательности 341 токен, три шага обучения
+на крошечной модели прошли.
+
+\begin{center}
+\begin{tabular}{@{}llrrr@{}}
+\toprule
+$H/F$ & Метод & R, \% & mR, \% & P, \% \\
+\midrule
+3/3 & copy-last & 34,4 & 25,2 & --- \\
+3/3 & Markov    & 46,9 & --- & 66,7 \\
+5/5 & copy-last & 20,2 & --- & --- \\
+5/5 & Markov    & 34,5 & --- & --- \\
+\bottomrule
+\end{tabular}
+\end{center}
+\textbf{Это не результат}, а проверка, что конвейер работает: видео одно, а марковская цепочка
+обучена на том же видео. Для боксов постоянная скорость хуже copy в эгоцентричном видео
+(mIoU@1с 46 против 60): камера движется вместе с головой.
+
+\paragraph{Не проверено:} запуск с реальными весами 3B, DeepSpeed ZeRO-3 и flash-attn;
+конвертер \code{psg4d} на настоящих файлах PSG4D-HOI (формат восстановлен по скрипту
+визуализации авторов, файлы на SharePoint требуют входа).
+
+%======================================================================
+\section{Запуск}
+
+\begin{lstlisting}
+git clone -b forecasting https://github.com/lve-gh/SVG2 && cd SVG2
+
+# 1. Данные: PSG4D-HOI или запасной вариант из действий HOI4D
+python traser/data/prepare_psg4d_hoi.py psg4d --psg4d_json HOI/psg4d_hoi.json \
+    --categories HOI/categories.json --hoi4d_root HOI/HOI4D_release \
+    --mask_root HOI/HOI4D_mask --out_dir traser/data
+python traser/data/prepare_psg4d_hoi.py hoi4d --hoi4d_root HOI4D_release \
+    --annotation_root HOI4D_annotations --instructions HOI4D-Instructions \
+    --out_dir traser/data
+
+# 2. Проверка окружения и базовые методы
+python traser/tests/test_forecast_smoke.py
+cd traser && python -m traser_train.forecast.baselines \
+    --train data/psg4d_hoi_train.json --test data/psg4d_hoi_test.json \
+    --history_sec 3 --horizon_sec 3
+
+# 3. Обучение (NUM_GPUS, MODE, LAMBDA_LATENT, LAMBDA_BOX, EXTRA_ARGS)
+STAGE=A bash traser/scripts/train_forecast.sh
+STAGE=B bash traser/scripts/train_forecast.sh
+
+# 4. Оценка
+python -m traser_train.forecast.evaluate --model checkpoints/traser_f_latent_stageB \
+    --annotation data/psg4d_hoi_test.json --history_sec 3 --horizon_sec 3 \
+    --mode latent --output preds.jsonl
+\end{lstlisting}
+
+%======================================================================
+\section{Открытые вопросы}\label{sec:open}
+
+\begin{itemize}
+  \item \textbf{Файлы PSG4D-HOI.} Нужны \code{psg4d\_hoi.json} и \code{categories.json}
+        (SharePoint NTU, нужен вход). До этого~--- разметка из действий HOI4D.
+  \item \textbf{3D.} Боксы сейчас 2D (\code{forecaster\_box\_dim=4}). Для 3D-версии TRASER
+        достаточно задать размерность 3D-бокса и считать цели по глубине; остальной
+        прогнозатор от этого не зависит. Нужен код командной 3D-адаптации.
+  \item \textbf{Временное разрешение.} Если метрики по секундам упрутся в потолок~--- слоты
+        по 0,5~с (\code{sample\_fps 4}, полусекундные метки); прогнозатор не меняется.
+  \item \textbf{Многовариантное будущее.} Прогнозатор детерминированный. Если H2 работает, но
+        R@$k$ быстро падает с $k$,~--- стохастический латент (SDE, как в SceneSayer/FDSG) и
+        оценка best-of-N.
+  \item \textbf{Сервер.} Нужны число и тип GPU (\code{nvidia-smi}), чтобы подобрать
+        \code{NUM\_GPUS}, батч и конфигурацию DeepSpeed.
+\end{itemize}
+
+%======================================================================
+\section*{Источники}
+\begin{itemize}
+  \item TRASER / SVG2: \url{https://github.com/uwGZQ/SVG2}
+  \item PSG4D: \url{https://arxiv.org/abs/2405.10305}, \url{https://github.com/Jingkang50/PSG4D}
+  \item SceneSayer (Towards Scene Graph Anticipation): \url{https://arxiv.org/abs/2403.04899}
+  \item ImparTail: \url{https://github.com/rohithpeddi/ImparTail}
+  \item FDSG: \url{https://arxiv.org/abs/2506.01487}
+  \item OOTSM: \url{https://arxiv.org/abs/2509.05661}
+  \item HyperGLM (CVPR 2025): \url{https://openaccess.thecvf.com/content/CVPR2025/papers/Nguyen_HyperGLM_HyperGraph_for_Video_Scene_Graph_Generation_and_Anticipation_CVPR_2025_paper.pdf}
+  \item FORESCENE: \url{https://arxiv.org/abs/2503.06182}
+\end{itemize}
+
+\end{document}
