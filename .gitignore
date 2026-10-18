@@ -20,3 +20,7 @@ traser/checkpoints/
 SVG2/
 wandb/
 output/
+
+# local sample videos and personal notes
+videos/
+HISTORY.txt
